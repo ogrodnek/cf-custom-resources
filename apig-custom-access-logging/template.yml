@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  StageName:
+    Type: String
+    Default: "Prod"
+
+Resources:
+  MyCustomResourceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:*
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - apigateway:PATCH
+            Resource:
+            - !Sub "arn:aws:apigateway:us-west-2::/restapis/${MyApi}/*"
+
+  MyApi:
+    Type: 'AWS::Serverless::Api'
+    Properties:
+      Name:
+        Fn::Sub: MyApi-${StageName}
+      StageName:
+        Ref: StageName
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub "test-api-${StageName}"
+        paths:
+          /:
+            get:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                type: "mock"
+         
+  MyCustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Timeout: 30
+      Runtime: python2.7
+      Role: !GetAtt MyCustomResourceLambdaRole.Arn
+
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.vendored import requests
+          def configure(event):
+            props = event['ResourceProperties']
+            als = props['AccessLogSettings']
+            (restApiId, stageName, fmt, destArn) = (props['Api'], props['Stage'], als['format'], als['destinationArn'])
+            client = boto3.client('apigateway', 'us-west-2')
+
+            return client.update_stage(
+              restApiId=restApiId, stageName=stageName,
+              patchOperations=[
+                { 'op': 'replace','path': '/accessLogSettings/format','value': fmt.strip() },
+                { 'op': 'replace','path': '/accessLogSettings/destinationArn','value': destArn.strip()[:-2] }
+              ]
+            )
+
+          def send_resp(event, status, e = None):
+            phys_id = "{}-{}".format(event['LogicalResourceId'], event['ServiceToken'][-12:])
+            payload = {
+              'Status': status,
+              'PhysicalResourceId': phys_id,
+              'StackId': event['StackId'],
+              'RequestId': event['RequestId'],
+              'LogicalResourceId': event['LogicalResourceId'],
+              'Data': {}
+            }
+
+            if e:
+              payload['Reason'] = str(e)[0:512]
+            
+            print(payload)
+
+            r = requests.put(event['ResponseURL'], data=json.dumps(payload), timeout=30)
+
+
+          def handler(event, context):
+            print(json.dumps(event, indent=2))
+
+            r = None
+
+            try:
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                configure(event)
+              r = send_resp(event, 'SUCCESS')
+            except Exception as e:
+              print(e)
+              r = send_resp(event, 'FAILED', e)
+            
+            if r:
+              return r.status_code
+            else:
+              return 0
+
+  MyLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+
+  MyCustomResource:
+    Type: Custom::MyCustomResource
+    Properties:
+      ServiceToken: !GetAtt MyCustomResourceLambda.Arn
+      Stage: !Ref StageName
+      Api: !Ref MyApi
+      AccessLogSettings:
+        destinationArn: !GetAtt MyLogGroup.Arn
+        format: |
+          { "principalId":"$context.authorizer.principalId", "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","path":"$context.path", "status":"$context.status","protocol":"$context.protocol", "responseLength":$context.responseLength, "stage": "$context.stage" }
